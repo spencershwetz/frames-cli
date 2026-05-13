@@ -1,11 +1,11 @@
 ---
 name: frames-cli
-description: Frame screenshots with the `frames` CLI. Use this skill when the user asks to add Apple device bezels, frame screenshots, create device mockups, inspect screenshot/device matches, or batch-process screenshot folders with the command line.
+description: Frame screenshots and screen recordings with the `frames` CLI. Use this skill when the user asks to add Apple device bezels, frame screenshots or videos, create device mockups, inspect screenshot/device matches, batch-process screenshot folders, or generate app-ready H.265/H.264 media with transparent or flattened borders.
 ---
 
 # Apple Frames CLI
 
-`frames` 1.2.7 is a single-file Python CLI that applies Apple device bezels to screenshots, auto-detects devices from screenshot dimensions, applies masks when needed, and can merge multiple framed results into one composite image.
+`frames` 1.2.7 is a single-file Python CLI that applies Apple device bezels to screenshots and screen recordings, auto-detects devices from screenshot dimensions, applies masks when needed, and can merge multiple framed results into one composite image.
 
 ## What Agents Should Know
 
@@ -63,6 +63,10 @@ frames doctor
 # Download or re-point assets
 frames setup
 frames setup /path/to/Frames
+
+# Frame screen recordings
+frames video recording.mov --device "iPhone 16 Pro Portrait" --codec h265-alpha
+frames video recording.mov --device "iPhone 16 Pro Portrait" --codec h265 --background "#141210"
 ```
 
 ## Current Feature Surface
@@ -79,6 +83,7 @@ frames setup /path/to/Frames
 - Inspect screenshots and folders with `info`.
 - Diagnose assets and config with `doctor`.
 - Save per-device default colors with `colors`.
+- Frame screen recordings with `video`, including `h265-alpha`, `h265`, `h264`, and `prores-alpha` outputs.
 
 ## Command Notes
 
@@ -91,8 +96,19 @@ frames setup /path/to/Frames
 - `frames list-colors` does partial device-name matching. `frames list-colors "17 Pro"` is valid.
 - Directory inputs are expanded one level deep only. The CLI scans top-level image files inside the directory; it is not recursive.
 - Supported input image extensions are `.png`, `.jpg`, `.jpeg`, `.heic`, `.tiff`, and `.webp`.
+- Supported input video extensions are `.mov`, `.mp4`, and `.m4v`.
 - Images larger than `20,000px` on either side trigger a warning. Images larger than `50,000px` are rejected.
 - `--subfolder` only accepts a single directory name, not a path like `../out` or `foo/bar`.
+
+## Video Output Behavior
+
+- `frames video ... --codec h265-alpha --background transparent` creates a `.mov` with HEVC alpha. Use this for app UI, Notelet-style sheets, and other contexts where the outside of the device should be transparent.
+- `frames video ... --codec h265 --background "#141210"` creates a small flattened HEVC `.mp4`.
+- `frames video ... --codec h264 --background "#141210"` creates a flattened H.264 `.mp4` for broader compatibility.
+- `frames video ... --codec prores-alpha` creates a large ProRes 4444 `.mov` for editing workflows.
+- `--background transparent` requires `h265-alpha` or `prores-alpha`; H.265/H.264 MP4 outputs must use a color or `blur`.
+- Use `--fps 60` by default unless the user asks to reduce frame rate.
+- Use `--quality 0.8` for `h265-alpha` alpha quality; use CRF-style values such as `24` for `h265`/`h264`.
 
 ## JSON Output Behavior
 
@@ -103,6 +119,7 @@ frames setup /path/to/Frames
 - When proportional merge scaling is applied, per-frame `scale_factor` values are included in the JSON output.
 - `frames --json info ...` returns either one object or a list of objects, including `device`, `primary_match`, `colors`, `color_count`, `has_mask`, `resize_width`, `variants`, and `is_variant`.
 - `frames --json doctor` returns asset path/source/version, PNG count, config presence, issues, notes, and suggested next steps.
+- `frames --json video ...` returns source, device, color, codec, background, dimensions, frame size, duration, and output.
 
 ## Assets and Config
 

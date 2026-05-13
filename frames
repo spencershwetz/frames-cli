@@ -42,6 +42,8 @@ ASSETS_MIN_VERSION = 4
 LARGE_IMAGE_WARN_DIMENSION = 20000
 LARGE_IMAGE_MAX_DIMENSION = 50000
 VALID_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".heic", ".tiff", ".webp"}
+VALID_VIDEO_EXTS = {".mov", ".mp4", ".m4v"}
+VIDEO_CODECS = {"h265-alpha", "h265", "h264", "prores-alpha"}
 
 
 def get_shortcuts_assets_dir(home=None):
@@ -684,6 +686,82 @@ def load_mask(assets_dir, model_name):
         return _load_rgba_asset_cached(str(mask_path)).copy()
     return None
 
+def probe_video(path):
+    """Return basic video metadata from ffprobe."""
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe",
+                "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height,duration:format=duration",
+                "-of", "json",
+                str(path),
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError) as e:
+        raise RuntimeError(f"Could not inspect video with ffprobe: {e}") from e
+
+    data = json.loads(result.stdout)
+    stream = data.get("streams", [{}])[0]
+    duration = stream.get("duration") or data.get("format", {}).get("duration")
+    if not stream.get("width") or not stream.get("height") or not duration:
+        raise RuntimeError("Could not determine video width, height, and duration.")
+    return int(stream["width"]), int(stream["height"]), float(duration)
+
+def ffmpeg_escape(value):
+    """Escape string values used inside ffmpeg filter arguments."""
+    return str(value).replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+
+def normalize_background_color(value):
+    """Return an ffmpeg color value for hex, named, or 0x colors."""
+    if value.startswith("#"):
+        return "0x" + value[1:]
+    return value
+
+def default_video_output_path(source, codec):
+    """Choose a sensible default video output path for the codec."""
+    suffix = ".mov" if codec in {"h265-alpha", "prores-alpha"} else ".mp4"
+    return source.with_name(f"{source.stem}_framed{suffix}")
+
+def build_video_encode_args(codec, quality):
+    """Return ffmpeg encoder arguments for a named output codec."""
+    if codec == "h265-alpha":
+        return [
+            "-c:v", "hevc_videotoolbox",
+            "-tag:v", "hvc1",
+            "-alpha_quality", str(quality),
+            "-allow_sw", "1",
+            "-b:v", "4500k",
+            "-movflags", "+faststart",
+        ]
+    if codec == "h265":
+        return [
+            "-c:v", "libx265",
+            "-tag:v", "hvc1",
+            "-preset", "medium",
+            "-crf", str(quality),
+            "-movflags", "+faststart",
+        ]
+    if codec == "h264":
+        return [
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", str(quality),
+            "-movflags", "+faststart",
+        ]
+    if codec == "prores-alpha":
+        return [
+            "-c:v", "prores_ks",
+            "-profile:v", "4444",
+            "-pix_fmt", "yuva444p10le",
+        ]
+    raise ValueError(f"Unknown video codec: {codec}")
+
 def apply_mask(screenshot, mask):
     """Apply mask to screenshot — black pixels in mask make screenshot transparent."""
     r, g, b, a = screenshot.split()
@@ -878,6 +956,144 @@ def frame_screenshot(
     }
 
     return result, info
+
+def cmd_video(args):
+    """Frame a screen recording with a device bezel using ffmpeg."""
+    source = Path(args.file)
+    if not source.exists():
+        print(f"{C.red('Error')}: File not found: {source}", file=sys.stderr)
+        sys.exit(1)
+    if source.suffix.lower() not in VALID_VIDEO_EXTS:
+        print(f"{C.red('Error')}: Expected a video file: {source}", file=sys.stderr)
+        sys.exit(1)
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        print(f"{C.red('Error')}: ffmpeg and ffprobe are required for video framing.", file=sys.stderr)
+        sys.exit(1)
+
+    codec = args.codec
+    if args.background == "transparent" and codec not in {"h265-alpha", "prores-alpha"}:
+        print(
+            f"{C.red('Error')}: --background transparent requires --codec h265-alpha or prores-alpha.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    assets_dir = Path(args.assets) if hasattr(args, "assets") and args.assets else get_assets_dir()
+    device_dict = load_json(assets_dir)
+    device_index = build_device_name_index(device_dict)
+
+    entry = device_index.get(args.device)
+    if not entry:
+        print(f"{C.red('Error')}: Device '{args.device}' not found. Run 'frames list'.", file=sys.stderr)
+        sys.exit(1)
+
+    model_name = entry["name"]
+    color = (
+        get_color(model_name, args.color, user_defaults=load_config().get("default_colors", {}))
+        if entry.get("colors") == "yes"
+        else None
+    )
+    frame, frame_path = load_frame(assets_dir, model_name, color)
+    if not frame:
+        print(f"{C.red('Error')}: Frame asset not found: {frame_path}", file=sys.stderr)
+        sys.exit(1)
+
+    mask_path = assets_dir / f"{model_name}_mask.png"
+    mask = load_mask(assets_dir, model_name) if entry.get("mask") == "yes" else None
+
+    try:
+        video_w, video_h, duration = probe_video(source)
+    except RuntimeError as e:
+        print(f"{C.red('Error')}: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    screen_w, screen_h = mask.size if mask else (video_w, video_h)
+    x, y = int(entry["x"]), int(entry["y"])
+    fps = max(1, int(args.fps))
+    output = Path(args.output) if args.output else default_video_output_path(source, codec)
+    output.parent.mkdir(parents=True, exist_ok=True)
+
+    if args.quality is None:
+        quality = 0.8 if codec == "h265-alpha" else 24
+    else:
+        quality = args.quality
+
+    if codec == "h265-alpha":
+        output_format = "bgra"
+    elif codec == "prores-alpha":
+        output_format = "yuva444p10le"
+    else:
+        output_format = "yuv420p"
+
+    inputs = ["-i", str(source)]
+    background_setup = ""
+    if args.background == "blur":
+        background_setup = (
+            f"[0:v]scale={frame.width}:{frame.height}:force_original_aspect_ratio=increase,"
+            f"crop={frame.width}:{frame.height},boxblur=40:1,setsar=1,format=rgba[base];"
+        )
+    else:
+        alpha = "0.0" if args.background == "transparent" else "1.0"
+        color_value = "black" if args.background == "transparent" else normalize_background_color(args.background)
+        background_setup = (
+            f"color=c={ffmpeg_escape(color_value)}@{alpha}:s={frame.width}x{frame.height}:"
+            f"r={fps}:d={duration},format=rgba[base];"
+        )
+
+    if mask:
+        inputs.extend(["-loop", "1", "-i", str(mask_path), "-loop", "1", "-i", frame_path])
+        filter_complex = (
+            f"[0:v]scale={screen_w}:{screen_h},fps={fps},format=rgba[screen];"
+            "[1:v]format=gray[mask];"
+            "[screen][mask]alphamerge[masked];"
+            f"{background_setup}"
+            f"[base][masked]overlay={x}:{y}:format=auto[tmp];"
+            f"[tmp][2:v]overlay=0:0:format=auto,format={output_format},"
+            f"trim=duration={duration},setpts=PTS-STARTPTS[out]"
+        )
+    else:
+        inputs.extend(["-loop", "1", "-i", frame_path])
+        filter_complex = (
+            f"[0:v]scale={screen_w}:{screen_h},fps={fps},format=rgba[screen];"
+            f"{background_setup}"
+            f"[base][screen]overlay={x}:{y}:format=auto[tmp];"
+            f"[tmp][1:v]overlay=0:0:format=auto,format={output_format},"
+            f"trim=duration={duration},setpts=PTS-STARTPTS[out]"
+        )
+
+    cmd = [
+        "ffmpeg", "-y",
+        *inputs,
+        "-filter_complex", filter_complex,
+        "-map", "[out]", "-map", "0:a?",
+        *build_video_encode_args(codec, quality),
+        "-c:a", "copy",
+        str(output),
+    ]
+
+    if args.verbose:
+        print(" ".join(cmd))
+    try:
+        subprocess.run(cmd, check=True)
+    except subprocess.CalledProcessError as e:
+        print(f"{C.red('Error')}: ffmpeg failed with exit code {e.returncode}", file=sys.stderr)
+        sys.exit(e.returncode)
+
+    payload = {
+        "source": str(source),
+        "device": model_name,
+        "color": color,
+        "codec": codec,
+        "background": args.background,
+        "dimensions": f"{video_w}x{video_h}",
+        "frame_size": f"{frame.width}x{frame.height}",
+        "duration": duration,
+        "output": str(output),
+    }
+    if args.json:
+        print(json.dumps(payload))
+    else:
+        print(f"{C.green('✓')} {output}")
 
 # ── CLI Commands ─────────────────────────────────────────────────────────────
 
@@ -1680,6 +1896,26 @@ def build_parser():
     frame_p.add_argument("--subfolder", dest="subfolder", metavar="NAME", help="Save to custom subfolder (e.g. --subfolder mockups)")
     frame_p.add_argument("--json", action="store_true", dest="frame_json", help=argparse.SUPPRESS)
 
+    # Video command
+    video_p = sub.add_parser("video", help="Frame a screen recording with a device bezel")
+    video_p.add_argument("file", help="Screen recording video file")
+    video_p.add_argument("--device", "-d", required=True, help="Device frame to use")
+    video_p.add_argument("--color", "-c", help="Frame color name, index, or 'random'")
+    video_p.add_argument(
+        "--codec",
+        choices=sorted(VIDEO_CODECS),
+        default="h265-alpha",
+        help="Output codec (default: h265-alpha)",
+    )
+    video_p.add_argument(
+        "--background",
+        default="transparent",
+        help="transparent, blur, color name, 0xRRGGBB, or #RRGGBB (default: transparent)",
+    )
+    video_p.add_argument("--output", "-o", help="Output video path")
+    video_p.add_argument("--fps", type=int, default=60, help="Output frame rate (default: 60)")
+    video_p.add_argument("--quality", type=float, help="Codec quality: alpha quality for h265-alpha, CRF for h264/h265")
+
     # List command
     sub.add_parser("list", help="List supported devices")
 
@@ -1710,7 +1946,7 @@ def main():
 
     # Pre-process argv: if the first non-flag arg isn't a known subcommand,
     # assume it's a file and inject "frame" as the subcommand
-    known_cmds = {"frame", "list", "list-colors", "colors", "info", "setup", "doctor", "-h", "--help", "--version"}
+    known_cmds = {"frame", "video", "list", "list-colors", "colors", "info", "setup", "doctor", "-h", "--help", "--version"}
     argv = sys.argv[1:]
     if argv:
         global_flags = {"-h", "--help", "--version", "--no-color", "--json", "-v", "--verbose"}
@@ -1762,6 +1998,7 @@ def main():
     # Route commands
     cmds = {
         "frame": cmd_frame,
+        "video": cmd_video,
         "list": cmd_list,
         "list-colors": cmd_list_colors,
         "colors": cmd_colors,

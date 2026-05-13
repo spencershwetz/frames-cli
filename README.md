@@ -9,11 +9,12 @@ Frame device screenshots with Apple product bezels from the command line. Auto-d
 ### Requirements
 - Python 3.8+
 - Pillow (Python imaging library)
+- ffmpeg and ffprobe for video framing
 
 ### Option A: Clone the repo (recommended)
 
 ```bash
-git clone https://github.com/viticci/frames-cli.git
+git clone https://github.com/spencershwetz/frames-cli.git
 cd frames-cli
 pip3 install Pillow
 ```
@@ -48,7 +49,7 @@ frames --version
 ```bash
 pip3 install Pillow
 mkdir -p ~/.local/bin
-curl -o ~/.local/bin/frames https://raw.githubusercontent.com/viticci/frames-cli/main/frames
+curl -o ~/.local/bin/frames https://raw.githubusercontent.com/spencershwetz/frames-cli/main/frames
 chmod +x ~/.local/bin/frames
 ```
 
@@ -113,6 +114,9 @@ frames info screenshot.png
 
 # List all supported devices
 frames list
+
+# Frame a screen recording with transparent space outside the device
+frames video recording.mov --device "iPhone 16 Pro Portrait" --codec h265-alpha
 ```
 
 ---
@@ -137,6 +141,42 @@ frames -m -s 80 screenshot1.png screenshot2.png
 **Device detection:** Automatic from screenshot pixel width. When multiple devices share a width, height disambiguates. The newest device frame is used when multiple generations share a resolution — override with `--device`.
 
 **Color resolution:** `--color` flag > user default (set via `colors` command) > first color in device's list.
+
+---
+
+### Video framing
+
+Frame screen recordings with the same device assets and masks used for screenshots.
+
+```bash
+# HEVC/H.265 with alpha, best for app UI where the outside of the device should be transparent
+frames video recording.mov \
+  --device "iPhone 16 Pro Portrait" \
+  --color Natural \
+  --codec h265-alpha \
+  --background transparent \
+  --output framed.mov
+
+# Flattened HEVC/H.265 MP4, best for small app-ready clips when transparency is not needed
+frames video recording.mov \
+  --device "iPhone 16 Pro Portrait" \
+  --color Natural \
+  --codec h265 \
+  --background "#141210" \
+  --output framed.mp4
+
+# H.264 MP4 for broader compatibility
+frames video recording.mov --device "iPhone 16 Pro Portrait" --codec h264 --background "#141210"
+```
+
+Supported codecs:
+
+- `h265-alpha` creates a `.mov` using HEVC with alpha. Use this when the area outside the device should be transparent.
+- `h265` creates a flattened HEVC/H.265 `.mp4`.
+- `h264` creates a flattened H.264 `.mp4`.
+- `prores-alpha` creates a large ProRes 4444 `.mov` with alpha for editing workflows.
+
+`--background transparent` requires `h265-alpha` or `prores-alpha`. For flattened `h265`/`h264`, pass a color such as `#141210`, `0x141210`, or use `blur`.
 
 ---
 
